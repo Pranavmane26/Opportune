@@ -1,0 +1,285 @@
+import jwt from "jsonwebtoken";
+import dbConfig from "@/config/db.config";
+import { NextRequest, NextResponse } from "next/server";
+import Program from "@/models/Program";
+import Team from "@/models/Team";
+import Student from "@/models/Student";
+import Payment from "@/models/Payment";
+import crypto from "crypto";
+
+dbConfig();
+
+export async function POST(req: NextRequest) {
+  try {
+    const token = req.cookies.get("token")?.value;
+    if (!token) {
+      return NextResponse.json({ message: "Unauthorized: No token found" }, { status: 401 });
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET!) as {
+      id: string;
+      role: string;
+    };
+
+    if (decoded.role !== "student") {
+      return NextResponse.json({ message: "Only students can participate in programs" }, { status: 403 });
+    }
+
+    const studentId = decoded.id;
+    const student = await Student.findById(studentId);
+    if (!student) {
+      return NextResponse.json({ message: "Student not found" }, { status: 404 });
+    }
+
+    const body = await req.json();
+    const { action, programId, teamName, teamCode, teamPassword, razorpay_order_id, razorpay_payment_id, razorpay_signature } = body;
+
+    if (!programId) {
+      console.warn("Participation failed: Program ID is missing");
+      return NextResponse.json({ message: "Program ID is required" }, { status: 400 });
+    }
+
+    const program = await Program.findById(programId).populate("event");
+    if (!program) {
+      console.warn("Participation failed: Program not found for ID:", programId);
+      return NextResponse.json({ message: "Program not found" }, { status: 404 });
+    }
+
+    // Payment signature verification for paid programs (individual or team leader pays)
+    const price = program.pricePerTeam || 0;
+    if (price > 0 && (action === "individual" || action === "create-team")) {
+      if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+        console.warn("Participation failed: Missing payment verification parameters. order_id:", razorpay_order_id, "payment_id:", razorpay_payment_id, "signature:", razorpay_signature);
+        return NextResponse.json({ message: "Payment verification details are required for this program" }, { status: 400 });
+      }
+
+      const bodyData = razorpay_order_id + "|" + razorpay_payment_id;
+      const expectedSignature = crypto
+        .createHmac("sha256", (process.env.RAZORPAY_KEY_SECRET || "eIco6L2xvGHf2H32RuKhG20G").trim())
+        .update(bodyData.toString())
+        .digest("hex");
+
+      if (expectedSignature !== razorpay_signature) {
+        console.warn("Participation failed: Razorpay signature mismatch. Expected:", expectedSignature, "Received:", razorpay_signature);
+        return NextResponse.json({ message: "Payment signature verification failed. Transaction unauthorized." }, { status: 400 });
+      }
+
+      // Log Payment transaction
+      const newPayment = new Payment({
+        payer: studentId,
+        college: program.event?.college || null,
+        event: program.event?._id || null,
+        program: programId,
+        amount: price,
+        platformCut: Math.round(price * 0.1),
+        paymentGatewayRef: razorpay_payment_id,
+        status: "paid",
+        createdAt: new Date(),
+      });
+      await newPayment.save();
+    }
+
+    // 1. INDIVIDUAL PARTICIPATION
+    if (action === "individual") {
+      if (program.type !== "individual") {
+        console.warn("Participation failed: Program requires team participation but individual was requested");
+        return NextResponse.json({ message: "This program requires team participation" }, { status: 400 });
+      }
+
+      // Check if student is already registered for this program
+      const existingTeam = await Team.findOne({ program: programId, leader: studentId });
+      if (existingTeam) {
+        console.warn("Participation failed: Student is already registered (leader) for program:", programId);
+        return NextResponse.json({ message: "You are already registered for this program" }, { status: 400 });
+      }
+
+      // Create a single-member team
+      const newTeam = new Team({
+        program: programId,
+        name: `${student.name} - Individual`,
+        leader: studentId,
+        members: [studentId],
+        status: "locked", // locked since it's individual
+      });
+
+      await newTeam.save();
+
+      // Update program metrics
+      program.totalRegistrations = (program.totalRegistrations || 0) + 1;
+      program.totalParticipants = (program.totalParticipants || 0) + 1;
+      await program.save();
+
+      return NextResponse.json({
+        message: "Successfully registered for the program!",
+        team: newTeam,
+      }, { status: 201 });
+    }
+
+    // 2. CREATE A TEAM
+    if (action === "create-team") {
+      if (program.type !== "team") {
+        console.warn("Participation failed: Program requires individual participation but team creation was requested");
+        return NextResponse.json({ message: "This program requires individual participation" }, { status: 400 });
+      }
+
+      if (!teamName || teamName.trim() === "") {
+        console.warn("Participation failed: Team name is required");
+        return NextResponse.json({ message: "Team name is required" }, { status: 400 });
+      }
+
+      // Check if team name is already taken (unique in DB)
+      const nameExists = await Team.findOne({ name: teamName });
+      if (nameExists) {
+        console.warn("Participation failed: Team name is already taken:", teamName);
+        return NextResponse.json({ message: "Team name is already taken. Please choose another name." }, { status: 400 });
+      }
+
+      // Check if student is already leading a team in this program
+      const isAlreadyLeader = await Team.findOne({ program: programId, leader: studentId });
+      if (isAlreadyLeader) {
+        console.warn("Participation failed: Student is already leading a team in this program:", programId);
+        return NextResponse.json({ message: "You have already created a team for this program" }, { status: 400 });
+      }
+
+      // Check if student is already a member of any team in this program
+      const isAlreadyMember = await Team.findOne({ program: programId, members: studentId });
+      if (isAlreadyMember) {
+        console.warn("Participation failed: Student is already a member of a team in this program:", programId);
+        return NextResponse.json({ message: "You are already a member of a team in this program" }, { status: 400 });
+      }
+
+      // Retrieve optional teammate emails
+      const { teammateEmails } = body;
+      const finalMembers = [studentId];
+      if (teammateEmails && teammateEmails.length > 0) {
+        for (const email of teammateEmails) {
+          const cleanEmail = email.toLowerCase().trim();
+          if (cleanEmail === "") continue;
+          
+          const teammate = await Student.findOne({ email: cleanEmail });
+          if (!teammate) {
+            return NextResponse.json({ 
+              message: `Student with email "${email}" not found. Please make sure they are registered on Opportune first.` 
+            }, { status: 400 });
+          }
+          
+          const teammateId = teammate._id.toString();
+          if (teammateId === studentId) {
+            continue; // Leader is already added
+          }
+          
+          // Verify they aren't already registered
+          const alreadyRegistered = await Team.findOne({ program: programId, members: teammateId });
+          if (alreadyRegistered) {
+            return NextResponse.json({ 
+              message: `Student "${teammate.name}" (${email}) is already registered in a team for this program.` 
+            }, { status: 400 });
+          }
+          
+          finalMembers.push(teammateId);
+        }
+      }
+
+      // Check team size limits
+      const maxLimit = program.teamSize?.max || 4;
+      if (finalMembers.length > maxLimit) {
+        return NextResponse.json({ message: `Maximum limit: ${maxLimit} members. You entered too many teammate emails.` }, { status: 400 });
+      }
+
+      // Generate credentials
+      const generatedCode = "TM-" + Math.floor(100000 + Math.random() * 900000);
+      const generatedPassword = Math.floor(1000 + Math.random() * 9000).toString();
+      const teamStatus = finalMembers.length >= maxLimit ? "locked" : "open";
+
+      const newTeam = new Team({
+        program: programId,
+        name: teamName,
+        leader: studentId,
+        members: finalMembers,
+        credentials: {
+          teamCode: generatedCode,
+          password: generatedPassword,
+        },
+        status: teamStatus,
+      });
+
+      await newTeam.save();
+
+      // Update program metrics
+      program.totalRegistrations = (program.totalRegistrations || 0) + 1;
+      program.totalParticipants = (program.totalParticipants || 0) + finalMembers.length;
+      await program.save();
+
+      return NextResponse.json({
+        message: "Team created successfully!",
+        team: newTeam,
+      }, { status: 201 });
+    }
+
+    // 3. JOIN A TEAM
+    if (action === "join-team") {
+      if (program.type !== "team") {
+        return NextResponse.json({ message: "This program is for individual participation" }, { status: 400 });
+      }
+
+      if (!teamCode || !teamPassword) {
+        return NextResponse.json({ message: "Team code and password are required" }, { status: 400 });
+      }
+
+      // Find the team
+      const team = await Team.findOne({
+        program: programId,
+        "credentials.teamCode": teamCode.trim()
+      });
+
+      if (!team) {
+        return NextResponse.json({ message: "Invalid Team Code" }, { status: 404 });
+      }
+
+      if (team.credentials.password !== teamPassword.trim()) {
+        return NextResponse.json({ message: "Incorrect password for this team" }, { status: 400 });
+      }
+
+      // Check if student is already in this team
+      if (team.members.includes(studentId)) {
+        return NextResponse.json({ message: "You are already a member of this team" }, { status: 400 });
+      }
+
+      // Check if student is already in ANY team in this program
+      const isAlreadyInAnyTeam = await Team.findOne({ program: programId, members: studentId });
+      if (isAlreadyInAnyTeam) {
+        return NextResponse.json({ message: "You are already registered in a team for this program" }, { status: 400 });
+      }
+
+      // Check team size limits
+      const maxLimit = program.teamSize?.max || 4;
+      if (team.members.length >= maxLimit) {
+        return NextResponse.json({ message: `This team is already full (Maximum limit: ${maxLimit} members)` }, { status: 400 });
+      }
+
+      // Add student to members list
+      team.members.push(studentId);
+      
+      // If team is now full, lock it
+      if (team.members.length >= maxLimit) {
+        team.status = "locked";
+      }
+
+      await team.save();
+
+      // Update program metrics
+      program.totalParticipants = (program.totalParticipants || 0) + 1;
+      await program.save();
+
+      return NextResponse.json({
+        message: "Successfully joined the team!",
+        team,
+      }, { status: 200 });
+    }
+
+    return NextResponse.json({ message: "Invalid action" }, { status: 400 });
+  } catch (error: any) {
+    console.error("Error in program participation route:", error);
+    return NextResponse.json({ message: error.message || "Internal Server Error" }, { status: 500 });
+  }
+}
